@@ -11,16 +11,19 @@ from numpy import linalg
 import math
 from scipy.special import gamma, digamma, polygamma
 from scipy.spatial import distance
-from scipy.linalg import cholesky
+# from scipy.linalg import cholesky
 from copy import deepcopy
 from sklearn.cluster import KMeans
 from sklearn import datasets
 from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
 import newton_raphson
+import pandas as pd
+import scipy
 
 
 def multi_student_pdf(x, params, k):
-    '''computes student's t pdf for a vector x and component k
+    '''computes student's t pdf for a vector x and component k --> equation 4
     '''
     deg_k = params['degs'][k]
     sig_k = params['cov_mat'][k]
@@ -34,8 +37,8 @@ def multi_student_pdf(x, params, k):
         x_i = x[i]
         num = gamma((deg_k + dim) / 2)
         mah = distance.mahalanobis(x_i, mu_k, sig_k)
-        product = 1 + mah / deg_k
-        denom = gamma(deg_k / 2) * (deg_k * np.pi) ** (dim / 2) * math.sqrt(cov_det) * product ** (deg_k + dim)
+        product = 1 + mah**2 / deg_k
+        denom = gamma(deg_k / 2) * (deg_k * np.pi) ** (dim / 2) * math.sqrt(cov_det) * np.power(product, (deg_k+dim)/2)
         pdf[i] = np.divide(num, denom)
         # if (i==66):
         #   print(x_i, num, product, denom)
@@ -43,11 +46,12 @@ def multi_student_pdf(x, params, k):
 
 
 def bounded_multi_student_pdf(x, params, k):
-    """computes bounded student's t pdf for a vector x and component k
+    """computes bounded student's t pdf for a vector x and component k --> equation 5
     """
-    m = 50000  # size of the generated data to calculate the normalization constant
+    m = 5000  # size of the generated data to calculate the normalization constant
     pdf = multi_student_pdf(x, params, k)
     ind = indicate(x, params, k)
+    indsum = ind.sum()
     pdf = pdf * ind
     n_const = normalization_const(params, k, m)
     pdf = pdf / n_const + 1e-5
@@ -55,6 +59,7 @@ def bounded_multi_student_pdf(x, params, k):
 
 
 def normalization_const(params, k, m):
+    '''calculate the integral of multivariate t : the normalization constant in bounded t pdf'''
     s, h_s = sample(params, k, m)
     ind = indicate(s, params, k)
     pdf = multi_student_pdf(s, params, k)
@@ -62,15 +67,17 @@ def normalization_const(params, k, m):
 
 
 def indicate(x, params, k):
+    '''H indicator function: equation 3
+    generates an (n, 1) array of zeros and ones, where n is the number of samples = x.shape[0]'''
     n, d = x.shape
     up_k = params['upper_bound'][k]
     low_k = params['lower_bound'][k]
-    ret = np.array([int(np.where(((xi < up_k).all() and (xi > low_k).all()), 1, 0)) for xi in x])
+    ret = np.array([int(np.where(((xi <= up_k).all() and (xi >= low_k).all()), 1, 0)) for xi in x])
     return ret
 
 
 def h(xi, params, k):
-    """gamma weights for the bounded version of SMM"""
+    """gamma weights for the bounded version of SMM --> equation 17"""
 
     d = xi.shape[0]
     d_k = params['degs'][k]
@@ -83,6 +90,7 @@ def h(xi, params, k):
 
 
 def sample(params, k, m):
+    '''generate m samples of data following params of k-th mixture component'''
     mu_k = params['means'][k]
     sig_k = params['cov_mat'][k]
     d_k = params['degs'][k]
@@ -101,15 +109,17 @@ def log_sum_exp(x, axis):
 
 
 def post_lik(x, K, params):
+    '''calculate the posterior and the log-likelihood in the E step
+    '''
     prior = params['prior']
     n = x.shape[0]
-    logresp = np.zeros((n, K))
+    logresp = np.zeros((n, K))  # log posterior matrix
     for k in range(K):
         pdf = np.log(bounded_multi_student_pdf(x, params, k))
         logresp[:, k] = np.log(prior[k]) + pdf
-    ll_new = np.sum(log_sum_exp(logresp, axis=1))
+    ll_new = np.sum(log_sum_exp(logresp, axis=1))  # log-likelihood --> equation 7
     logresp -= np.vstack(log_sum_exp(logresp, axis=1))
-    resp = np.exp(logresp)
+    resp = np.exp(logresp)  # in equation 9, z_ij = resp[i,j]
     return ll_new, resp
 
 
@@ -128,6 +138,7 @@ def post_lik(x, K, params):
 
 
 def update_weights(posterior):
+    '''equation 21'''
     counts = posterior.sum(axis=0)
     weights = np.divide(counts, np.sum(counts))
     return weights
@@ -138,28 +149,35 @@ def update_weights(posterior):
 #    return spdiags(array, 0, n, n).toarray()
 
 
-def R(params, s, h_s, k):
-    m = 50000
+def R(params, k):
+    '''calculate R and G parameters for means and covariance martrices update'''
+    m = 5000
     mu_k = params['means'][k]
     d = mu_k.shape[0]
     sig_k = params['cov_mat'][k]
+
+    s, h_s = sample(params, k, m)
 
     # s = data_sampler.multivariate_t_sampler(mu_k, sig_k, d_k, m)
 
     # calculate term R for means update
     # h_s = np.array([ h(x, params, k) for x in s])
-    ind = indicate(s, params, k)
+    ind = indicate(s, params, k)  ##ind=H(s, bounds)
     ind_sum = ind.sum()
+    print("samples[k]: ", s.shape)
+    print("means[k]: ",mu_k.shape)
+    print("h_s: ", h_s.shape)
     Rk = ((s - mu_k).T * h_s).T * ind.reshape((m, 1))
-    Rk = Rk.sum(axis=0) / ind_sum
+    Rk = Rk.sum(axis=0) / ind_sum  ##equation 18
 
     # calculate term G for covariance matrix update
     Gk = np.array(
         [sig_k - x.reshape((d, 1)) * x.reshape((d, 1)).T * h(x, params, k) for x in s])  # array of n (d*d) matrices
-    Gk = (Gk * ind.reshape((m, 1, 1))).sum(axis=0) / ind_sum
+    Gk = (Gk * ind.reshape((m, 1, 1))).sum(axis=0) / ind_sum  ## equation 19
     return Rk, Gk
 
 
+'''
 def adjust_cov(cov):
     eigvals, v = np.linalg.eig(cov)
     l = np.diag(eigvals)
@@ -167,24 +185,49 @@ def adjust_cov(cov):
     v[v < 0] = 10e-6
     ret = np.matmul(np.matmul(v, l), np.linalg.inv(v))
     return ret
+'''
+
+
+def get_closest_pos_def(x):
+    '''gets the closest positive definite matrix to the input matrix x
+    this function will be used to adjust the covariance matrix after its update'''
+    y = (x + x.T) / 2
+    eig, v = np.linalg.eig(y)
+    d = np.diag(eig)
+    d[d < 0] = 0
+    # ret = np.matmul(np.matmul(v, d), np.linalg.inv(v))
+    dim = x.shape[0]
+    ret = np.matmul(np.matmul(v, d), v.T)
+    ret = ret + np.identity(dim) * 10e-8
+
+    return ret
+
+
+def test_p_d(m):
+    '''test positive definiteness of input matrix m'''
+    return not (not np.allclose(m, m.T) or np.any(np.linalg.eigvalsh(m) <= 0))
 
 
 def update_means_cov(x, params, posterior, Rk, Gk, k):
+    '''update mean and covariance matrix for component k, using the pre-calculated parameters Rk and Gk (equations 18 and 19)'''
     n, d = x.shape
     mu_k = params['means'][k]
     p_k = posterior[:, k]
     h_x = np.array([h(xi, params, k) for xi in x])
     numer = (p_k.reshape((n, 1)) * (h_x.reshape((n, 1)) * x - Rk)).sum(axis=0)
     denom = np.dot(p_k, h_x)
-    mu = numer / denom
+    mu = numer / denom ##equation 14
 
     p_h_k = p_k * h_x  # element-wise multiplication of posteriors by gamma weights for component k
-    cov = (np.dot(p_h_k * (x - mu_k).T, (x - mu_k)) / p_k.sum()) + (1e-5 * np.eye(d))
-    test = not (not np.allclose(cov, cov.T) or np.any(linalg.eigvalsh(cov) <= 0))
-    testgk = not (not np.allclose(Gk, Gk.T) or np.any(linalg.eigvalsh(Gk) <= 0))
-    cov = cov - Gk  # cov: new d*d covariance matrix for component k
-    test2 = not (not np.allclose(cov, cov.T) or np.any(linalg.eigvalsh(cov) <= 0))
-    return (mu, cov)
+    cov = (np.dot(p_h_k * (x - mu_k).T, (x - mu_k)) / p_k.sum()) + (1e-6 * np.eye(d))
+    #test = test_p_d(cov)
+    #testgk = test_p_d(Gk)
+    cov = cov - Gk  # cov: new d*d covariance matrix for component k --> equation 15
+    test2 = test_p_d(cov) #sanity check: test positive definiteness of the new cov matrix
+    if not test2:
+        cov = get_closest_pos_def(cov) #change cov matrix if it fails the check
+    testf = test_p_d(cov) #final check: should be equal to True
+    return mu, cov
 
 
 def _validate_covariances(cov, n_components):
@@ -208,27 +251,30 @@ def _validate_covariances(cov, n_components):
             )
 
 
-def update_dof(x, params, posterior, s, h_s, k):
-    '''
-    update the degrees of freedom for component k
-    parameters: x: dataset, n*d matrix 
-                params: component k parameters
-                posterior: n*K matrix of responsibilities, where K is the number of components
-                s: generated multivariate student t data sample with respect to params[k], m*d matrix
-                h_s: h(s), m*1 p array
-                k: int, k-th component
-    '''
+def update_dof(x, params, posterior, k):
+    
+    #update the degrees of freedom for component k
+    #parameters: x: dataset, n*d matrix 
+    #            params: component k parameters
+    #          posterior: n*K matrix of responsibilities, where K is the number of components
+    #           s: generated multivariate student t data sample with respect to params[k], m*d matrix
+    #         h_s: h(s), m*1 p array
+    #         k: int, k-th component
+    
+    m = 5000
     n, d = x.shape
     mu_k = params['means'][k]
     sig_k = params['cov_mat'][k]
     d_k = params['degs'][k]
     p_k = posterior[:, k]
+    s, h_s = sample(params, k, m)
     ind = indicate(s, params, k)
     ind_sum = ind.sum()
     p_k_sum = p_k.sum()
     mah = np.array([distance.mahalanobis(xi, mu_k, sig_k) for xi in x])
 
     def f(v):
+        #returns the expression in the equation 16: the equation that the new degree of freedom is a solution to
         term1 = -digamma(v / 2) + np.log(v / 2) + digamma((v + d) / 2) - np.log((v + d) / 2) + 1
         h = (v + d) / (v + mah)
         term2 = np.dot(p_k, (np.log(h) - h)) / p_k_sum
@@ -236,6 +282,7 @@ def update_dof(x, params, posterior, s, h_s, k):
         return term1 + term2 + term3
 
     def fprime(v):
+        #derivative of f
         term1p = -polygamma(1, v / 2) / 2 + 1 / v + polygamma(1, (v + d) / 2) - 1 / (v + d)
         h = (v + d) / (v + mah)
         hprime = (mah - d) / (v + mah) ** 2
@@ -256,6 +303,50 @@ def update_dof(x, params, posterior, s, h_s, k):
     print('alt degree of freedom:', new_deg_alt, 'gives: ', f(new_deg_alt))
     return new_deg
 
+
+'''
+def update_dof(x, params, resp, k):
+    """Solves the equation to calculate the next value of the degrees of freedom.
+    """
+    tol = 1e-4
+    n_iter = 1000
+    degs = params['degs']
+    u = params['prior']
+    n_components = degs.shape[0]
+    n_dim = x.shape[1]
+    resp_sum = resp.sum(axis=0)
+
+    # Initialisation
+    new_degs = np.empty_like(degs)
+
+    # Calculate the constant part of the equation to calculate the
+    # new degrees of freedom
+    vdim = (degs + n_dim) / 2.0
+    resp_logu_sum = np.sum(resp * (np.log(u) - u), axis=0)
+    constant_part = 1.0 \
+                    + resp_logu_sum / resp_sum \
+                    + scipy.special.digamma(vdim) \
+                    - np.log(vdim)
+
+    # Solve the equation numerically using Newton-Raphson for each
+    # component of the mixture
+    for c in range(n_components):
+        def func(x): return np.log(x / 2.0) \
+                            - scipy.special.digamma(x / 2.0) \
+                            + constant_part[c]
+
+        def fprime(x): return 1.0 / x \
+                              - scipy.special.polygamma(1, x / 2.0) / 2.0
+
+        def fprime2(x): return - 1.0 / (x * x) \
+                               - scipy.special.polygamma(2, x / 2.0) / 4.0
+
+        new_degs[c] = scipy.optimize.newton(
+            func, degs[c], fprime, args=(), tol=tol,
+            maxiter=n_iter, fprime2=fprime2
+        )
+    return new_degs[k]
+'''
 
 def update_bounds(x, params, posterior, K):
     n, d = x.shape
@@ -289,13 +380,12 @@ def EM(x, params):
         # update bounds before beginning maximization
         new_params['lower_bound'], new_params['upper_bound'] = update_bounds(x, new_params, posterior, K)
         for k in range(K):
-            m = 50000  # sample size for data generation
-            s, h_s = sample(new_params, k, m)  # data generation
-            Rk, Gk = R(new_params, s, h_s,
-                       k)  # preparing terms for the calculation of the new mean and covariance matrix
+            m = 5000  # sample size for data generation
+            # s, h_s = sample(new_params, k, m)  # data generation
+            Rk, Gk = R(new_params, k)  # preparing terms for the calculation of the new mean and covariance matrix
             new_params['means'][k], new_params['cov_mat'][k] = update_means_cov(x, new_params, posterior, Rk, Gk, k)
 
-            new_params['degs'][k] = update_dof(x, new_params, posterior, s, h_s, k)
+            #new_params['degs'][k] = update_dof(x, new_params, posterior, k)
         _validate_covariances(new_params['cov_mat'], K)
         # new_params['lower_bound'],new_params['upper_bound'] = update_bounds(x, posterior, K)
         # print('iter: ', i, 'cov: ', new_params['cov_mat'])
@@ -314,6 +404,7 @@ def EM(x, params):
 def init_params(data, num_clusters):
     kmeans_model = KMeans(n_clusters=num_clusters, n_init=5, max_iter=400, random_state=1)
     kmeans_model.fit(data)
+    n, d = data.shape
     centroids, cluster_assignment = kmeans_model.cluster_centers_, kmeans_model.labels_
     in_labels = np.unique(cluster_assignment, return_index=True)[1]
     unsorted_labels = [cluster_assignment[index] for index in sorted(in_labels)]
@@ -338,22 +429,33 @@ def init_params(data, num_clusters):
         # calculate covariance matrix for the ith component
         m_r = data[cluster_assignment == i]  # member rows
         m_r = m_r - m_r.mean(0)
-        # cov = np.matmul(np.transpose(m_r), m_r) / m_r.shape[0]
+        cov1 = np.matmul(np.transpose(m_r), m_r) / m_r.shape[0]
+        testcov1 = not (not np.allclose(cov1, cov1.T) or np.any(linalg.eigvalsh(cov1) <= 0))
         # covs.append(np.sqrt(cov))
         cov = np.cov(m_r.T)
+        testcov = not (not np.allclose(cov, cov.T) or np.any(linalg.eigvalsh(cov) <= 0))
         cov[cov < 1e-6] = 1e-6
         covs.append(cov)
 
-    lower_bound = []
-    upper_bound = []
-    for i in unsorted_labels:
-        lower_bound.append(np.amin(data[cluster_assignment == i], axis=0))
-        upper_bound.append(np.amax(data[cluster_assignment == i], axis=0))
+    up = np.zeros((num_clusters, d)) + np.max(data, axis=0)
+    low = np.zeros((num_clusters, d)) + np.min(data, axis=0)
+
+    #for i in unsorted_labels:
+    #    lower_bound.append(np.amin(data[cluster_assignment == i], axis=0))
+    #    upper_bound.append(np.amax(data[cluster_assignment == i], axis=0))
     params = {'prior': np.array(weights), 'means': np.array(means), 'cov_mat': np.array(covs), 'degs': np.array(degs),
-              'lower_bound': np.array(lower_bound), 'upper_bound': np.array(upper_bound)}
+              'lower_bound': low, 'upper_bound': up}
     return params
 
+'''
+syndata = pd.read_csv('synthetic_2d_data.csv')
+data = syndata[['0','1']].to_numpy()
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data)
+labels = syndata['label'].to_numpy()
 
+params = init_params(data_scaled, np.unique(labels).shape[0])
+'''
 iris = datasets.load_iris()
 params = init_params(iris.data, np.unique(iris.target).shape[0])
 

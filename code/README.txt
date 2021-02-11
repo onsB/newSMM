@@ -1,0 +1,1 @@
+This is the implementation of SMM, the multivariate student's t mixture model
